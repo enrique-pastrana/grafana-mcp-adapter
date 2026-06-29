@@ -163,7 +163,7 @@ function toLokiNs(value, fallbackSecondsAgo) {
 async function fetchLogPreview({ query, from, to, limit }) {
   const data = await grafanaDatasourceProxyGet(LOGS_DATASOURCE_UID, "loki/api/v1/query_range", {
     query,
-    start: toLokiNs(from, 15 * 60),
+    start: toLokiNs(from, 60 * 60),
     end: toLokiNs(to, 0),
     limit,
     direction: "backward",
@@ -184,6 +184,57 @@ async function fetchLogPreview({ query, from, to, limit }) {
   // Streams come grouped; sort newest-first and cap to `limit`.
   lines.sort((a, b) => (a.ts < b.ts ? 1 : -1));
   return lines.slice(0, limit);
+}
+
+// When a logs query returns nothing, the `client` text often just doesn't match
+// any `service_name`. Fetch the label's values and suggest the closest ones so
+// the caller can correct the spelling. Returns a small, de-duplicated list.
+async function suggestClients(client, { from } = {}) {
+  let values = [];
+  try {
+    const data = await grafanaDatasourceProxyGet(LOGS_DATASOURCE_UID, "loki/api/v1/label/service_name/values", {
+      start: toLokiNs(from, 60 * 60),
+    });
+    values = data?.data || [];
+  } catch {
+    return [];
+  }
+  const needle = String(client || "").toLowerCase();
+  if (!needle) return [];
+  // Compare the needle against each dash-separated segment of the service_name
+  // (e.g. "graviteeio-ae-april-rec-engine" -> ae/april/rec/engine), so a typo
+  // like "aprl" scores well against the "april" segment. Rank by: substring
+  // containment first, then best (lowest) edit distance to any segment.
+  const scored = values
+    .map((v) => {
+      const lv = v.toLowerCase();
+      const segments = lv.split(/[-_.]/).filter(Boolean);
+      const contains = lv.includes(needle);
+      const bestDist = Math.min(...segments.map((seg) => editDistance(needle, seg)), needle.length);
+      return { v, contains, bestDist };
+    })
+    // Keep substring hits, or close typos (edit distance <= ~1/3 of the word).
+    .filter((x) => x.contains || x.bestDist <= Math.max(1, Math.ceil(needle.length / 3)))
+    .sort((a, b) => Number(b.contains) - Number(a.contains) || a.bestDist - b.bestDist);
+  return [...new Set(scored.map((x) => x.v))].slice(0, 10);
+}
+
+// Classic Levenshtein edit distance (small strings; fine for label matching).
+function editDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i];
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = curr;
+  }
+  return prev[n];
 }
 
 async function withToolLogging(tool, fields, fn) {
@@ -300,29 +351,41 @@ server.tool(
     "with free text (e.g. client='april', component='gateway') — it matches " +
     "case-insensitively against the `service_name` label, which encodes both. " +
     "Optionally narrow with line_filter (substring that must appear in the log line). " +
-    "Default range is the last 15 minutes; widen with from/to (e.g. from='now-6h'). " +
+    "Default range is the last 1 hour; widen with from/to (e.g. from='now-6h'). " +
     "Returns { query, explore_url, range, preview_count, preview }. Paste explore_url " +
     "into the ticket; ask the user before widening the range since logs are large.",
   {
     client: z.string().describe("Customer name fragment, e.g. 'april', 'alliander', 'apim-cloudgate'."),
     component: z.string().optional().describe("Component fragment, e.g. 'gateway', 'engine', 'ui'."),
     line_filter: z.string().optional().describe("Only lines containing this substring."),
-    from: z.string().default("now-15m").describe("Range start, e.g. 'now-15m', 'now-6h', or epoch ms."),
+    from: z.string().default("now-1h").describe("Range start, e.g. 'now-1h', 'now-6h', or epoch ms."),
     to: z.string().default("now").describe("Range end, e.g. 'now' or epoch ms."),
     limit: z.number().int().min(1).max(500).default(50).describe("Max preview lines (newest first)."),
   },
-  async ({ client, component, line_filter, from = "now-15m", to = "now", limit = 50 }) =>
+  async ({ client, component, line_filter, from = "now-1h", to = "now", limit = 50 }) =>
     withToolLogging("grafana_logs_link", { client, component, from, to }, async () => {
       const query = buildLogsQuery({ client, component, lineFilter: line_filter });
       const explore_url = buildExploreUrl({ datasourceUid: LOGS_DATASOURCE_UID, query, from, to });
       const preview = await fetchLogPreview({ query, from, to, limit });
-      return textResult({
+      const result = {
         query,
         explore_url,
         range: { from, to },
         preview_count: preview.length,
         preview,
-      });
+      };
+      // No lines usually means the client/component text didn't match any
+      // service_name. Offer close matches (the link is still valid regardless).
+      if (preview.length === 0) {
+        const suggestions = await suggestClients(client, { from });
+        if (suggestions.length) {
+          result.note = `No log lines matched in this range. Did you mean one of these service_name values? Re-run with a closer 'client'.`;
+          result.suggestions = suggestions;
+        } else {
+          result.note = `No log lines matched in this range. Try widening from/to or adjusting client/component.`;
+        }
+      }
+      return textResult(result);
     }),
 );
 
