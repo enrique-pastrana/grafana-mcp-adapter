@@ -6,8 +6,8 @@
   "description": "Read-only Grafana MCP adapter (dashboards + datasources + queries) for local-tooling",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test grafanaClient.test.js",
-    "check": "node --check server.js grafanaClient.js"
+    "test": "node --test",
+    "check": "node --check server.js grafanaClient.js helpers.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.5",

@@ -17,8 +17,11 @@ not chained to one another.
 - Auth: a Grafana **service account token** sent as a Bearer token in the
   `Authorization` header. Scope it to a read-only role (Viewer). Create the
   service account + token in Grafana → Administration → Service accounts.
-- The adapter returns **raw** payloads (dashboard JSON, query frames). Any
-  summarizing is done by the calling skill, never by a tool here.
+- Most tools return **raw** payloads (dashboard JSON, datasource lists). The
+  exceptions are the high-volume ones: `grafana_query` returns a compact
+  per-series digest by default (a full `up` query is ~8 MB of frames, far past
+  what an MCP context wants), and `grafana_logs_link` returns a capped preview.
+  Both can be pushed back toward raw (`raw=true` / a higher `limit`).
 - Read-only by design. Note that `grafana_query` is a `POST` (Grafana's
   `/api/ds/query` is POST-shaped) but only **reads** metrics/logs.
 
@@ -30,7 +33,42 @@ not chained to one another.
 | `grafana_search_dashboards` | Search dashboards by title substring and/or tags. |
 | `grafana_get_dashboard` | Full dashboard JSON by `uid`. |
 | `grafana_list_datasources` | List configured datasources (uid, name, type). |
-| `grafana_query` | Run a PromQL/LogQL/etc. query against a datasource uid over a time range. |
+| `grafana_query` | Run a PromQL/LogQL/etc. query against a datasource uid over a time range. Returns a per-series digest by default. |
+| `grafana_logs_link` | Build a permanent Grafana Explore (Loki) deep link for a customer's logs and return a preview of recent lines. |
+
+### `grafana_query` response shape
+
+The raw `/api/ds/query` response carries a full timestamp+value array per series,
+and a query like `up` can return thousands of series (~8 MB). By default the tool
+collapses each series to its labels + a numeric digest and caps the list:
+
+```jsonc
+{
+  "results": {
+    "A": {
+      "status": 200,
+      "series_count": 3085,        // total series before capping
+      "series": [                  // capped to maxSeries (50)
+        { "labels": { "job": "..." }, "count": 60, "first": 1, "last": 1, "min": 0, "max": 1, "avg": 0.98 }
+      ],
+      "truncated": 3035            // how many series were dropped from `series`
+    }
+  }
+}
+```
+
+Pass `raw=true` to get the full (potentially very large) frames instead.
+
+### `grafana_logs_link`
+
+Identify a customer/component with free text (`client='april'`,
+`component='gateway'`); it matches case-insensitively against the `service_name`
+label, which on this instance encodes both (e.g.
+`graviteeio-ae-april-rec-engine`). Returns `{ query, explore_url, range,
+preview_count, preview }` — paste `explore_url` (a permanent Grafana 11+ Explore
+link) into the ticket. The default range is the last hour; widen with
+`from`/`to`. When nothing matches, it returns close `service_name` values as
+`suggestions` so typos like `aprl → april` surface.
 
 ## Setup
 
