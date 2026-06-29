@@ -1,9 +1,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ENABLED, BASE_URL, log, requireConfig, grafanaGet, grafanaPost } from "./grafanaClient.js";
+import {
+  ENABLED,
+  BASE_URL,
+  log,
+  requireConfig,
+  grafanaGet,
+  grafanaPost,
+  grafanaDatasourceProxyGet,
+} from "./grafanaClient.js";
 
 const DEFAULT_LIMIT = Number.parseInt(process.env.GRAFANA_DEFAULT_LIMIT || "20", 10);
+// Loki datasource uid for the logs tools. Override per-instance via env.
+const LOGS_DATASOURCE_UID = process.env.GRAFANA_LOGS_DATASOURCE_UID || "grafanacloud-logs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,6 +108,82 @@ function summarizeQueryResult(payload = {}, { maxSeries = 50 } = {}) {
     };
   }
   return out;
+}
+
+// Escape a free-text fragment for safe use inside a Loki regex matcher.
+function escapeRegex(s = "") {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Build a LogQL selector from free-text client/component. Both are matched
+// case-insensitively as substrings of `service_name` (which in this instance
+// encodes both the customer and the component, e.g.
+// `graviteeio-ae-april-rec-engine`, `dev-apim-cloudgate-1ca08d-gateway`).
+// `lineFilter` becomes a `|= "..."` line filter on top.
+function buildLogsQuery({ client, component, lineFilter } = {}) {
+  if (!client) throw new Error("client is required");
+  const parts = [escapeRegex(client)];
+  if (component) parts.push(escapeRegex(component));
+  // (?i) = case-insensitive; .* between parts so order/extra segments are fine.
+  const selector = `{service_name=~"(?i).*${parts.join(".*")}.*"}`;
+  return lineFilter ? `${selector} |= \`${lineFilter.replace(/`/g, "")}\`` : selector;
+}
+
+// Build a permanent Grafana Explore deep link for a Loki query + time range.
+// Grafana 11+ (this instance is 13.x) reads a `panes` param: an object keyed by
+// an arbitrary pane id, each holding the datasource, queries and range. The old
+// `left=` array form is legacy (<=10) and is intentionally not emitted.
+function buildExploreUrl({ datasourceUid, query, from, to }) {
+  const pane = {
+    datasource: datasourceUid,
+    queries: [{ refId: "A", datasource: { type: "loki", uid: datasourceUid }, expr: query, queryType: "range" }],
+    range: { from, to },
+  };
+  const panes = encodeURIComponent(JSON.stringify({ logs: pane }));
+  return `${BASE_URL}/explore?schemaVersion=1&orgId=1&panes=${panes}`;
+}
+
+// Resolve Grafana-style relative ranges ("now-15m") to ns epoch for Loki's
+// query_range. Absolute epoch-ms strings/numbers pass through. Loki wants ns.
+function toLokiNs(value, fallbackSecondsAgo) {
+  const now = Date.now();
+  if (value === undefined || value === null || value === "") return `${(now - fallbackSecondsAgo * 1000) * 1e6}`;
+  const m = /^now(?:-(\d+)([smhd]))?$/.exec(String(value).trim());
+  if (m) {
+    if (!m[1]) return `${now * 1e6}`;
+    const n = Number(m[1]);
+    const unit = { s: 1e3, m: 6e4, h: 36e5, d: 864e5 }[m[2]];
+    return `${(now - n * unit) * 1e6}`;
+  }
+  // Assume epoch ms.
+  const ms = Number(value);
+  return Number.isFinite(ms) ? `${ms * 1e6}` : `${(now - fallbackSecondsAgo * 1000) * 1e6}`;
+}
+
+async function fetchLogPreview({ query, from, to, limit }) {
+  const data = await grafanaDatasourceProxyGet(LOGS_DATASOURCE_UID, "loki/api/v1/query_range", {
+    query,
+    start: toLokiNs(from, 15 * 60),
+    end: toLokiNs(to, 0),
+    limit,
+    direction: "backward",
+  });
+  const streams = data?.data?.result || [];
+  const lines = [];
+  for (const s of streams) {
+    for (const [tsNs, line] of s.values || []) {
+      lines.push({
+        ts: new Date(Number(tsNs) / 1e6).toISOString(),
+        namespace: s.stream?.namespace || null,
+        pod: s.stream?.pod || null,
+        level: s.stream?.detected_level || null,
+        line,
+      });
+    }
+  }
+  // Streams come grouped; sort newest-first and cap to `limit`.
+  lines.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+  return lines.slice(0, limit);
 }
 
 async function withToolLogging(tool, fields, fn) {
@@ -204,6 +290,39 @@ server.tool(
         ],
       });
       return textResult(raw ? payload : summarizeQueryResult(payload));
+    }),
+);
+
+server.tool(
+  "grafana_logs_link",
+  "Read-only: build a permanent Grafana Explore (Loki) link for a customer's logs " +
+    "AND return a preview of the most recent lines. Identify the customer/component " +
+    "with free text (e.g. client='april', component='gateway') — it matches " +
+    "case-insensitively against the `service_name` label, which encodes both. " +
+    "Optionally narrow with line_filter (substring that must appear in the log line). " +
+    "Default range is the last 15 minutes; widen with from/to (e.g. from='now-6h'). " +
+    "Returns { query, explore_url, range, preview_count, preview }. Paste explore_url " +
+    "into the ticket; ask the user before widening the range since logs are large.",
+  {
+    client: z.string().describe("Customer name fragment, e.g. 'april', 'alliander', 'apim-cloudgate'."),
+    component: z.string().optional().describe("Component fragment, e.g. 'gateway', 'engine', 'ui'."),
+    line_filter: z.string().optional().describe("Only lines containing this substring."),
+    from: z.string().default("now-15m").describe("Range start, e.g. 'now-15m', 'now-6h', or epoch ms."),
+    to: z.string().default("now").describe("Range end, e.g. 'now' or epoch ms."),
+    limit: z.number().int().min(1).max(500).default(50).describe("Max preview lines (newest first)."),
+  },
+  async ({ client, component, line_filter, from = "now-15m", to = "now", limit = 50 }) =>
+    withToolLogging("grafana_logs_link", { client, component, from, to }, async () => {
+      const query = buildLogsQuery({ client, component, lineFilter: line_filter });
+      const explore_url = buildExploreUrl({ datasourceUid: LOGS_DATASOURCE_UID, query, from, to });
+      const preview = await fetchLogPreview({ query, from, to, limit });
+      return textResult({
+        query,
+        explore_url,
+        range: { from, to },
+        preview_count: preview.length,
+        preview,
+      });
     }),
 );
 

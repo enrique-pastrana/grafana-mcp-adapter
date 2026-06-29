@@ -108,3 +108,13 @@ export async function grafanaGet(path, params = {}) {
 export async function grafanaPost(path, body, params = {}) {
   return request("POST", path, { params, body });
 }
+
+// Call a datasource's native API through Grafana's read-only proxy:
+//   /api/datasources/proxy/uid/{uid}/<datasourcePath>
+// We use this to hit Loki's query_range directly (the typed frames from
+// /ds/query are awkward for raw log lines). `dsPath` is the part after the uid,
+// e.g. "loki/api/v1/query_range".
+export async function grafanaDatasourceProxyGet(uid, dsPath, params = {}) {
+  const cleanPath = dsPath.replace(/^\/+/, "");
+  return grafanaGet(`/datasources/proxy/uid/${encodeURIComponent(uid)}/${cleanPath}`, params);
+}
