@@ -70,6 +70,34 @@ link) into the ticket. The default range is the last hour; widen with
 `from`/`to`. When nothing matches, it returns close `service_name` values as
 `suggestions` so typos like `aprl → april` surface.
 
+#### Examples (how a user asks for it)
+
+Just ask in plain language — the agent maps it to the `client` / `component` /
+`from` / `to` / `line_filter` arguments for you.
+
+> "Give me the last hour of API gateway logs for **Northwind**."
+> → `{ "client": "northwind", "component": "gateway" }`
+
+> "Show me the engine logs for **Contoso** over the last 6 hours."
+> → `{ "client": "contoso", "component": "engine", "from": "now-6h" }`
+
+> "Find the gateway errors for **Globex** in the last 3 hours, give me up to 200 lines."
+> → `{ "client": "globex", "component": "gateway", "line_filter": "error", "from": "now-3h", "limit": 200 }`
+
+> "I need the UI logs for **Initech** during yesterday's incident between 10:00 and 11:00."
+> → `{ "client": "initech", "component": "ui", "from": "<epoch ms 10:00>", "to": "<epoch ms 11:00>" }`
+
+> "Give me the **production** gateway logs for **Northwind**."
+> → `{ "client": "northwind prod", "component": "gateway" }`
+
+(The environment — `prod`, `rec`, `dev` — isn't a separate argument: it lives
+inside `service_name`, so just fold it into `client` as another word. Both
+`client` and `component` are matched as case-insensitive substrings with `.*`
+between them, so `northwind prod` matches `…-northwind-prod-…`.)
+
+Each call returns `explore_url` — paste it into the ticket as a permanent link —
+plus a capped `preview` of the newest matching lines.
+
 ## Setup
 
 ```bash
